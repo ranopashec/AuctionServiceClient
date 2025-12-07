@@ -24,35 +24,11 @@ th { background:#f2f2f2; }
 #bidModal .panel { background:white; padding:16px; border-radius:8px; width:320px; }
 #newLotForm { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
 #newLotForm input { width:200px; }
-.debug-panel { background:#f3f4f6; border:1px solid #d1d5db; padding:12px; margin:12px 0; border-radius:6px; }
-.debug-panel h4 { margin:0 0 8px 0; color:#374151; font-size:14px; }
-.debug-output { margin-top:8px; font-family:monospace; font-size:11px; max-height:200px; overflow-y:auto; background:#1f2937; color:#f3f4f6; padding:8px; border-radius:4px; }
-.debug-line { margin:2px 0; padding:2px 4px; }
-.debug-line.success { color:#4ade80; }
-.debug-line.error { color:#f87171; }
-.debug-line.info { color:#60a5fa; }
 </style>
 </head>
 <body>
 
 <h1>Клиент: Электронный аукцион — продажа земельных участков</h1>
-
-<div class="debug-panel">
-  <h4>Отладка токенов</h4>
-  <div style="display:flex; gap:8px; margin-bottom:8px;">
-    <button class="btn" onclick="testTokenFormats()">Тестировать форматы токена</button>
-    <button class="btn" onclick="showRawToken()">Показать токен</button>
-    <button class="btn" onclick="clearAllTokens()">Очистить токены</button>
-    <select id="tokenFormatSelect" style="margin-left:auto;">
-      <option value="Bearer">Bearer формат</option>
-      <option value="Token">Token формат</option>
-      <option value="Raw">Raw формат</option>
-      <option value="X-Auth-Token">X-Auth-Token заголовок</option>
-    </select>
-    <button class="btn btn-primary" onclick="saveTokenFormat()">Сохранить формат</button>
-  </div>
-  <div id="debugOutput" class="debug-output"></div>
-</div>
 
 <div class="controls">
   <label class="small">Auction URL:
@@ -80,6 +56,7 @@ th { background:#f2f2f2; }
   <input id="new_start_price" placeholder="Стартовая цена" type="number" step="0.01" required/>
   <input id="new_auction_end_date" placeholder="Дата окончания (гггг-мм-дд)" value=""/>
   <input id="new_description" placeholder="Описание"/>
+  <input id="new_owner_id" placeholder="ID владельца" value="org-123" required/>
   <button class="btn btn-primary" type="submit">Создать (CreateLot)</button>
 </form>
 
@@ -120,19 +97,13 @@ const cfg = {
   get auctionUrl(){ return document.getElementById('cfgAuctionUrl').value.replace(/\/+$/,''); },
   get paymentUrl(){ return document.getElementById('cfgPaymentUrl').value.replace(/\/+$/,''); },
   get orgId(){ return document.getElementById('cfgOrgId').value.trim(); },
-  serviceName: "AuctionService"
+  serviceName: "AuctionServiceRelease" // Исправлено для совпадения с сервером
 };
 
 // Конфигурация прокси
 const PROXY_CONFIG = {
   enabled: true,
   endpoint: '/api/proxy'
-};
-
-// Конфигурация формата токена
-const TOKEN_CONFIG = {
-  format: localStorage.getItem('token_format') || 'Bearer',
-  customHeader: localStorage.getItem('token_custom_header') || null
 };
 
 const state = {
@@ -148,32 +119,8 @@ function showMessage(text,type='info',ttl=4000){
   if(ttl>0)setTimeout(()=>{ if(box.innerHTML.includes(text)) box.innerHTML=''; },ttl);
 }
 
-function debugLog(msg, type='info') {
-  const el = document.getElementById('debugOutput');
-  const line = document.createElement('div');
-  line.className = `debug-line ${type}`;
-  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-  el.appendChild(line);
-  el.scrollTop = el.scrollHeight;
-  console.log(`[DEBUG] ${msg}`);
-}
-
-function loadTokens(){ 
-  try { 
-    const tokens = JSON.parse(localStorage.getItem('auction_tokens')||'{}');
-    debugLog(`Загружено ${Object.keys(tokens).length} токенов`, 'info');
-    return tokens; 
-  } catch(e){ 
-    debugLog('Ошибка загрузки токенов: ' + e.message, 'error');
-    return {}; 
-  }
-}
-
-function saveTokens(){ 
-  localStorage.setItem('auction_tokens',JSON.stringify(state.tokens)); 
-  updateTokenStatusUI();
-  debugLog('Токены сохранены', 'success');
-}
+function loadTokens(){ try { return JSON.parse(localStorage.getItem('auction_tokens')||'{}'); } catch(e){ return {}; } }
+function saveTokens(){ localStorage.setItem('auction_tokens',JSON.stringify(state.tokens)); updateTokenStatusUI(); }
 
 function updateTokenStatusUI(){
   const el = document.getElementById('tokenStatus');
@@ -209,19 +156,12 @@ function updateTokenStatusUI(){
 // получение токена для конкретного метода
 function tokenForMethod(method){
   const info=state.tokens[method];
-  if(!info) {
-    debugLog(`Токен для метода "${method}" не найден`, 'error');
-    return null;
-  }
-  
+  if(!info) return null;
   if(info.expiresAt && new Date(info.expiresAt).getTime() < Date.now()){
     delete state.tokens[method];
     saveTokens();
-    debugLog(`Токен для метода "${method}" истек`, 'error');
     return null;
   }
-  
-  debugLog(`Токен для метода "${method}" получен (длина: ${info.token?.length || 0})`, 'success');
   return info.token;
 }
 
@@ -232,7 +172,6 @@ async function fetchWithProxy(url, options = {}) {
   }
   
   try {
-    debugLog(`Прокси запрос: ${url}`, 'info');
     const proxyResponse = await fetch(PROXY_CONFIG.endpoint, {
       method: 'POST',
       headers: {
@@ -249,18 +188,14 @@ async function fetchWithProxy(url, options = {}) {
       throw new Error(`Proxy error: ${proxyResponse.status} - ${errorText}`);
     }
     
-    const result = await proxyResponse.json();
-    debugLog(`Прокси ответ: ${JSON.stringify(result).substring(0, 100)}`, 'success');
-    return result;
+    return await proxyResponse.json();
     
   } catch (proxyError) {
-    debugLog('Прокси не сработал: ' + proxyError.message, 'error');
+    console.warn('Proxy failed, trying direct request:', proxyError.message);
     
     try {
-      debugLog('Пробуем прямой запрос...', 'info');
       return await directFetch(url, options);
     } catch (directError) {
-      debugLog('Прямой запрос не сработал: ' + directError.message, 'error');
       return await fetchWithPublicProxy(url, options);
     }
   }
@@ -268,13 +203,6 @@ async function fetchWithProxy(url, options = {}) {
 
 // Прямой fetch запрос
 async function directFetch(url, options = {}) {
-  debugLog(`Прямой запрос: ${options.method || 'GET'} ${url}`, 'info');
-  
-  // Логируем заголовки
-  if (options.headers) {
-    debugLog(`Заголовки: ${JSON.stringify(options.headers)}`, 'info');
-  }
-  
   const response = await fetch(url, {
     ...options,
     headers: {
@@ -285,15 +213,12 @@ async function directFetch(url, options = {}) {
   });
   
   const text = await response.text();
-  debugLog(`Ответ: ${response.status} ${response.statusText}`, response.ok ? 'success' : 'error');
-  debugLog(`Тело ответа: ${text.substring(0, 200)}`, 'info');
-  
   let body = null;
   
   try {
     body = text ? JSON.parse(text) : null;
   } catch (e) {
-    debugLog('Ошибка парсинга JSON: ' + e.message, 'error');
+    console.warn('JSON parse error:', e);
     body = { text: text };
   }
   
@@ -309,7 +234,6 @@ async function directFetch(url, options = {}) {
 
 // Использование публичных CORS прокси в крайнем случае
 async function fetchWithPublicProxy(url, options = {}) {
-  debugLog('Пробуем публичные прокси...', 'info');
   const publicProxies = [
     'https://api.allorigins.win/raw?url=',
     'https://corsproxy.io/?',
@@ -319,16 +243,14 @@ async function fetchWithPublicProxy(url, options = {}) {
   for (const proxy of publicProxies) {
     try {
       const proxyUrl = proxy + encodeURIComponent(url);
-      debugLog(`Пробуем прокси: ${proxy}`, 'info');
       const response = await fetch(proxyUrl, options);
       
       if (response.ok) {
         const text = await response.text();
-        debugLog(`Публичный прокси сработал: ${proxy}`, 'success');
         return text ? JSON.parse(text) : null;
       }
     } catch (e) {
-      debugLog(`Прокси ${proxy} не сработал: ${e.message}`, 'error');
+      console.warn(`Public proxy ${proxy} failed:`, e.message);
     }
   }
   
@@ -337,45 +259,16 @@ async function fetchWithPublicProxy(url, options = {}) {
 
 // Основная функция для всех запросов с авторизацией
 async function fetchJson(url, options = {}, methodName = null) {
-  debugLog(`fetchJson: ${methodName || 'NO_AUTH'} ${options.method || 'GET'} ${url}`, 'info');
-  
   // Автоматически добавляем токен авторизации для платных методов
   if (methodName) {
     const token = tokenForMethod(methodName);
     if (token) {
-      // Формируем заголовок авторизации согласно конфигурации
-      if (TOKEN_CONFIG.customHeader) {
-        options.headers = {
-          ...options.headers,
-          [TOKEN_CONFIG.customHeader]: token
-        };
-        debugLog(`Используем кастомный заголовок: ${TOKEN_CONFIG.customHeader}: ${token.substring(0, 20)}...`, 'success');
-      } else {
-        let authHeader;
-        switch(TOKEN_CONFIG.format) {
-          case 'Bearer':
-            authHeader = 'Bearer ' + token;
-            break;
-          case 'Token':
-            authHeader = 'Token ' + token;
-            break;
-          case 'Raw':
-            authHeader = token;
-            break;
-          default:
-            authHeader = 'Bearer ' + token;
-        }
-        
-        options.headers = {
-          ...options.headers,
-          'Authorization': authHeader
-        };
-        debugLog(`Используем формат ${TOKEN_CONFIG.format}: Authorization: ${authHeader.substring(0, 30)}...`, 'success');
-      }
+      options.headers = {
+        ...options.headers,
+        'Authorization': 'Bearer ' + token
+      };
     } else {
-      const msg = `Для метода "${methodName}" требуется оплата. Сформируйте и оплатите счет.`;
-      showMessage(msg, 'error');
-      debugLog(msg, 'error');
+      showMessage(`Для метода "${methodName}" требуется оплата. Сформируйте и оплатите счет.`, 'error');
       throw new Error(`Token required for ${methodName}`);
     }
   }
@@ -393,8 +286,6 @@ async function requestBill(periodFrom, periodTo, methods) {
       methods 
     };
     
-    debugLog(`Формируем счет для методов: ${methods.join(', ')}`, 'info');
-    
     const body = await fetchJson(cfg.paymentUrl + '/bill', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -402,10 +293,9 @@ async function requestBill(periodFrom, periodTo, methods) {
     });
     
     state.paymentArtifact = body.paymentArtifact;
-    debugLog(`Счет сформирован. Артефакт: ${body.paymentArtifact}`, 'success');
     showMessage(`Счёт сформирован. Артефакт: ${body.paymentArtifact}`, 'success');
   } catch(err) { 
-    debugLog('Ошибка формирования счета: ' + err.message, 'error');
+    console.error(err); 
     showMessage('Ошибка формирования счета: ' + (err.body?.description || err.message || err.toString()), 'error'); 
   }
 }
@@ -418,23 +308,16 @@ async function payBill() {
   
   try {
     const payload = { paymentArtifact: state.paymentArtifact };
-    debugLog(`Оплачиваем счет: ${state.paymentArtifact}`, 'info');
-    
     const body = await fetchJson(cfg.paymentUrl + '/pay', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
     
-    debugLog(`Ответ оплаты: ${JSON.stringify(body)}`, 'info');
-    
     if (!body.token) { 
       showMessage('Ошибка: токен не получен', 'error'); 
       return; 
     }
-    
-    debugLog(`Получен токен длиной ${body.token.length} символов`, 'success');
-    debugLog(`Токен (первые 50): ${body.token.substring(0, 50)}...`, 'info');
     
     const info = await fetchJson(cfg.paymentUrl + '/payment/info', {
       method: 'POST',
@@ -442,25 +325,18 @@ async function payBill() {
       body: JSON.stringify({ paymentArtifact: state.paymentArtifact })
     });
     
-    debugLog(`Информация об оплате: ${JSON.stringify(info)}`, 'info');
-    
     info.methods.forEach(m => {
       state.tokens[m] = { 
         token: body.token, 
         expiresAt: info.paidUntil || null 
       };
-      debugLog(`Токен сохранен для метода: ${m}`, 'success');
     });
     
     saveTokens();
-    
-    // Показать токен для отладки
-    alert(`✅ Токен получен!\n\nДлина: ${body.token.length} символов\nФормат: ${TOKEN_CONFIG.format}${TOKEN_CONFIG.customHeader ? ` (заголовок: ${TOKEN_CONFIG.customHeader})` : ''}\n\nПервые 50 символов:\n${body.token.substring(0, 50)}...`);
-    
     showMessage('Оплата прошла успешно. Токены для методов получены', 'success');
     state.paymentArtifact = null;
   } catch(err) { 
-    debugLog('Ошибка оплаты: ' + err.message, 'error');
+    console.error(err); 
     showMessage('Оплата не удалась: ' + (err.body?.description || err.message || err.toString()), 'error'); 
   }
 }
@@ -468,14 +344,13 @@ async function payBill() {
 /* ====== CRUD + Bid ====== */
 async function loadLots() {
   try {
-    debugLog('Загружаем лоты...', 'info');
-    const body = await fetchJson(cfg.auctionUrl + '/lots');
+    // Исправлено: добавлен methodName для авторизации
+    const body = await fetchJson(cfg.auctionUrl + '/lots', {}, 'ListLots');
     state.lots = Array.isArray(body) ? body : [];
     renderTable();
-    debugLog(`Загружено ${state.lots.length} лотов`, 'success');
     showMessage('Лоты загружены', 'success', 1500);
   } catch(err) { 
-    debugLog('Ошибка загрузки лотов: ' + err.message, 'error');
+    console.error(err); 
     showMessage('Не удалось загрузить лоты: ' + (err.body?.error || err.message || err.toString()), 'error'); 
   }
 }
@@ -585,7 +460,6 @@ async function handleSave(id, tr) {
   if ('auction_end_date' in edits) payload.auction_end_date = formatDateForAPI(edits.auction_end_date);
   
   try {
-    debugLog(`Обновляем лот ${id}: ${JSON.stringify(payload)}`, 'info');
     await fetchJson(cfg.auctionUrl + '/lots/' + encodeURIComponent(id), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -594,10 +468,9 @@ async function handleSave(id, tr) {
     
     delete state.editing[id];
     await loadLots();
-    debugLog(`Лот ${id} обновлен`, 'success');
     showMessage('Lot обновлён', 'success');
   } catch(err) {
-    debugLog(`Ошибка обновления лота ${id}: ${err.message}`, 'error');
+    console.error(err);
     showMessage('Ошибка при обновлении: ' + (err.body?.error || err.message || err.toString()), 'error');
   }
 }
@@ -606,16 +479,14 @@ async function handleDelete(id) {
   if (!confirm('Удалить лот #' + id + '?')) return;
   
   try {
-    debugLog(`Удаляем лот ${id}`, 'info');
     await fetchJson(cfg.auctionUrl + '/lots/' + encodeURIComponent(id), {
       method: 'DELETE'
     }, 'DeleteLot');
     
     await loadLots();
-    debugLog(`Лот ${id} удален`, 'success');
     showMessage('Lot удалён', 'success');
   } catch(err) {
-    debugLog(`Ошибка удаления лота ${id}: ${err.message}`, 'error');
+    console.error(err);
     showMessage('Не удалось удалить: ' + (err.body?.error || err.message || err.toString()), 'error');
   }
 }
@@ -628,21 +499,22 @@ document.getElementById('newLotForm').onsubmit = async (e) => {
   const start_price = parseFloat(document.getElementById('new_start_price').value);
   const auction_end_date = document.getElementById('new_auction_end_date').value.trim();
   const description = document.getElementById('new_description').value.trim();
+  const owner_id = document.getElementById('new_owner_id').value.trim(); // Добавлено обязательное поле
   
-  if (!name || isNaN(start_price)) {
-    showMessage('Заполните имя и стартовую цену', 'error');
+  if (!name || isNaN(start_price) || !owner_id) {
+    showMessage('Заполните имя, стартовую цену и ID владельца', 'error');
     return;
   }
   
   const payload = {
     name,
     start_price,
+    owner_id, // Добавлено обязательное поле
     auction_end_date: formatDateForAPI(auction_end_date) || undefined,
     description: description || undefined
   };
   
   try {
-    debugLog(`Создаем лот: ${JSON.stringify(payload)}`, 'info');
     await fetchJson(cfg.auctionUrl + '/lots', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -651,10 +523,10 @@ document.getElementById('newLotForm').onsubmit = async (e) => {
     
     showMessage('Лот создан', 'success');
     e.target.reset();
+    document.getElementById('new_owner_id').value = cfg.orgId; // Восстанавливаем значение по умолчанию
     await loadLots();
-    debugLog('Лот создан успешно', 'success');
   } catch(err) {
-    debugLog(`Ошибка создания лота: ${err.message}`, 'error');
+    console.error(err);
     showMessage('Ошибка при создании: ' + (err.body?.error || err.message || err.toString()), 'error');
   }
 };
@@ -698,21 +570,20 @@ document.getElementById('btnPlaceBid').onclick = async () => {
   }
   
   try {
-    debugLog(`Ставка на лот ${currentBidLotId}: ${amount}`, 'info');
+    // Исправлено: изменено поле с bid_amount на amount
     await fetchJson(cfg.auctionUrl + '/lots/' + encodeURIComponent(currentBidLotId) + '/bid', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bid_amount: amount })
+      body: JSON.stringify({ amount: amount }) // Исправлено поле
     }, 'PlaceBid');
     
     document.getElementById('bidMessage').textContent = 'Ставка принята';
-    debugLog(`Ставка ${amount} на лот ${currentBidLotId} принята`, 'success');
     await loadLots();
     setTimeout(() => {
       document.getElementById('bidModal').style.display = 'none';
     }, 800);
   } catch(err) {
-    debugLog(`Ошибка ставки: ${err.message}`, 'error');
+    console.error(err);
     const errorMsg = err.body?.error || err.message || err.status || err.toString();
     
     if (errorMsg.includes('greater than current price')) {
@@ -734,7 +605,8 @@ document.getElementById('btnRequestBill').onclick = () => {
   const dateFrom = now.toISOString().split('T')[0];
   const dateTo = later.toISOString().split('T')[0];
   
-  requestBill(dateFrom, dateTo, ['CreateLot', 'UpdateLot', 'DeleteLot', 'PlaceBid']);
+  // Добавлен метод ListLots для получения списка лотов
+  requestBill(dateFrom, dateTo, ['CreateLot', 'UpdateLot', 'DeleteLot', 'PlaceBid', 'ListLots']);
 };
 
 document.getElementById('btnPayBill').onclick = payBill;
@@ -763,184 +635,9 @@ document.getElementById('btnShowTokens').onclick = () => {
   });
   
   txt += `\nВсего оплачено методов: ${keys.length}`;
-  txt += `\nФормат токена: ${TOKEN_CONFIG.format}`;
-  if (TOKEN_CONFIG.customHeader) {
-    txt += `\nКастомный заголовок: ${TOKEN_CONFIG.customHeader}`;
-  }
   
   alert(txt);
 };
-
-/* ---------- Отладочные функции ---------- */
-async function testTokenFormats() {
-  debugLog('=== Тестирование форматов токена ===', 'info');
-  
-  const token = tokenForMethod('CreateLot') || Object.values(state.tokens)[0]?.token;
-  
-  if (!token) {
-    debugLog('❌ Нет токена для тестирования. Сначала оплатите методы.', 'error');
-    alert('Сначала оплатите методы через "Сформировать счет" и "Оплатить счет".');
-    return;
-  }
-  
-  debugLog(`Токен для тестирования (длина ${token.length}): ${token.substring(0, 50)}...`, 'info');
-  
-  const testCases = [
-    { name: 'Bearer', getHeader: () => ({ 'Authorization': 'Bearer ' + token }) },
-    { name: 'Token', getHeader: () => ({ 'Authorization': 'Token ' + token }) },
-    { name: 'Raw', getHeader: () => ({ 'Authorization': token }) },
-    { name: 'X-Auth-Token', getHeader: () => ({ 'X-Auth-Token': token }) },
-    { name: 'X-Access-Token', getHeader: () => ({ 'X-Access-Token': token }) },
-    { name: 'X-API-Key', getHeader: () => ({ 'X-API-Key': token }) }
-  ];
-  
-  for (const testCase of testCases) {
-    try {
-      debugLog(`Тестируем формат: ${testCase.name}...`, 'info');
-      
-      const response = await fetch(cfg.auctionUrl + '/lots', {
-        method: 'GET',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          ...testCase.getHeader()
-        }
-      });
-      
-      const text = await response.text();
-      
-      if (response.ok) {
-        debugLog(`✅ УСПЕХ! Формат ${testCase.name} работает!`, 'success');
-        
-        // Определяем, кастомный ли это заголовок
-        if (testCase.name.includes('X-')) {
-          TOKEN_CONFIG.customHeader = Object.keys(testCase.getHeader())[0];
-          TOKEN_CONFIG.format = 'Custom';
-          document.getElementById('tokenFormatSelect').value = testCase.name;
-        } else {
-          TOKEN_CONFIG.format = testCase.name;
-          TOKEN_CONFIG.customHeader = null;
-          document.getElementById('tokenFormatSelect').value = testCase.name;
-        }
-        
-        saveTokenFormat();
-        alert(`✅ Найден рабочий формат токена: ${testCase.name}`);
-        return;
-      } else {
-        debugLog(`❌ Формат ${testCase.name}: ${response.status} - ${text.substring(0, 100)}`, 'error');
-      }
-    } catch (err) {
-      debugLog(`❌ Ошибка теста ${testCase.name}: ${err.message}`, 'error');
-    }
-  }
-  
-  debugLog('❌ Ни один из форматов не сработал', 'error');
-  alert('Ни один из форматов токена не сработал. Возможно, токен недействителен или сервер недоступен.');
-}
-
-function showRawToken() {
-  const keys = Object.keys(state.tokens);
-  if (keys.length === 0) {
-    alert('Нет сохраненных токенов');
-    return;
-  }
-  
-  const tokenInfo = state.tokens[keys[0]];
-  const token = tokenInfo?.token;
-  
-  if (!token) {
-    alert('Токен не найден');
-    return;
-  }
-  
-  const modal = document.createElement('div');
-  modal.style.position = 'fixed';
-  modal.style.top = '50%';
-  modal.style.left = '50%';
-  modal.style.transform = 'translate(-50%, -50%)';
-  modal.style.background = 'white';
-  modal.style.padding = '20px';
-  modal.style.border = '2px solid #2563eb';
-  modal.style.borderRadius = '8px';
-  modal.style.zIndex = '1000';
-  modal.style.maxWidth = '90%';
-  modal.style.maxHeight = '90%';
-  modal.style.overflow = 'auto';
-  
-  const title = document.createElement('h4');
-  title.textContent = 'Токен авторизации';
-  title.style.margin = '0 0 10px 0';
-  
-  const info = document.createElement('div');
-  info.innerHTML = `
-    <div><strong>Длина:</strong> ${token.length} символов</div>
-    <div><strong>Формат:</strong> ${TOKEN_CONFIG.format}</div>
-    ${TOKEN_CONFIG.customHeader ? `<div><strong>Заголовок:</strong> ${TOKEN_CONFIG.customHeader}</div>` : ''}
-  `;
-  info.style.marginBottom = '10px';
-  
-  const textarea = document.createElement('textarea');
-  textarea.value = token;
-  textarea.style.width = '500px';
-  textarea.style.height = '200px';
-  textarea.style.fontFamily = 'monospace';
-  textarea.style.padding = '10px';
-  textarea.style.border = '1px solid #ccc';
-  textarea.style.borderRadius = '4px';
-  textarea.style.resize = 'none';
-  
-  const closeBtn = document.createElement('button');
-  closeBtn.textContent = 'Закрыть';
-  closeBtn.className = 'btn';
-  closeBtn.style.marginTop = '10px';
-  closeBtn.onclick = () => document.body.removeChild(modal);
-  
-  modal.appendChild(title);
-  modal.appendChild(info);
-  modal.appendChild(textarea);
-  modal.appendChild(document.createElement('br'));
-  modal.appendChild(closeBtn);
-  document.body.appendChild(modal);
-  textarea.select();
-}
-
-function clearAllTokens() {
-  if (confirm('Очистить ВСЕ токены и настройки?')) {
-    localStorage.removeItem('auction_tokens');
-    localStorage.removeItem('token_format');
-    localStorage.removeItem('token_custom_header');
-    state.tokens = {};
-    TOKEN_CONFIG.format = 'Bearer';
-    TOKEN_CONFIG.customHeader = null;
-    document.getElementById('tokenFormatSelect').value = 'Bearer';
-    saveTokens();
-    debugLog('Все токены и настройки очищены', 'success');
-    updateTokenStatusUI();
-    alert('Все токены и настройки очищены.');
-  }
-}
-
-function saveTokenFormat() {
-  const format = document.getElementById('tokenFormatSelect').value;
-  
-  if (format === 'X-Auth-Token') {
-    TOKEN_CONFIG.format = 'Custom';
-    TOKEN_CONFIG.customHeader = 'X-Auth-Token';
-  } else {
-    TOKEN_CONFIG.format = format;
-    TOKEN_CONFIG.customHeader = null;
-  }
-  
-  localStorage.setItem('token_format', TOKEN_CONFIG.format);
-  if (TOKEN_CONFIG.customHeader) {
-    localStorage.setItem('token_custom_header', TOKEN_CONFIG.customHeader);
-  } else {
-    localStorage.removeItem('token_custom_header');
-  }
-  
-  debugLog(`Формат токена сохранен: ${format}${TOKEN_CONFIG.customHeader ? ` (заголовок: ${TOKEN_CONFIG.customHeader})` : ''}`, 'success');
-  alert(`Формат токена сохранен: ${format}`);
-}
 
 // Кнопка для включения/выключения прокси
 const proxyToggleBtn = document.createElement('button');
@@ -953,23 +650,14 @@ proxyToggleBtn.onclick = () => {
   PROXY_CONFIG.enabled = !PROXY_CONFIG.enabled;
   proxyToggleBtn.textContent = `Proxy: ${PROXY_CONFIG.enabled ? 'ON' : 'OFF'}`;
   proxyToggleBtn.style.background = PROXY_CONFIG.enabled ? '#4ade80' : '#f87171';
-  debugLog(`Прокси ${PROXY_CONFIG.enabled ? 'включен' : 'выключен'}`, 'info');
   showMessage(`Прокси ${PROXY_CONFIG.enabled ? 'включен' : 'выключен'}`, 'info', 2000);
 };
 
 document.querySelector('.controls').appendChild(proxyToggleBtn);
 
-// Установить сохраненный формат в селект
-if (TOKEN_CONFIG.customHeader === 'X-Auth-Token') {
-  document.getElementById('tokenFormatSelect').value = 'X-Auth-Token';
-} else {
-  document.getElementById('tokenFormatSelect').value = TOKEN_CONFIG.format;
-}
-
 // Инициализация
 updateTokenStatusUI();
 loadLots();
-debugLog('Клиент инициализирован', 'success');
 </script>
 </body>
 </html>
