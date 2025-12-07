@@ -17,7 +17,7 @@ th { background:#f2f2f2; }
 .btn-primary { background:#2563eb; color:white; border-color:transparent; }
 .btn-danger { background:#ef4444; color:white; border-color:transparent; }
 .inline-edit { min-width:120px; }
-.token-info { font-size:12px; color:#075985; margin-left:8px; }
+.token-info { font-size:12px; margin-left:8px; }
 .error { color:#b91c1c; font-weight:600; }
 .success { color:#065f46; font-weight:600; }
 #bidModal { display:none; position:fixed; left:0; top:0; right:0; bottom:0; background: rgba(0,0,0,0.4); align-items:center; justify-content:center; }
@@ -101,8 +101,8 @@ const cfg = {
 
 // Конфигурация прокси
 const PROXY_CONFIG = {
-  enabled: true, // Включить/выключить прокси
-  endpoint: '/api/proxy' // Эндпоинт прокси на Vercel
+  enabled: true,
+  endpoint: '/api/proxy'
 };
 
 const state = {
@@ -120,19 +120,36 @@ function showMessage(text,type='info',ttl=4000){
 
 function loadTokens(){ try { return JSON.parse(localStorage.getItem('auction_tokens')||'{}'); } catch(e){ return {}; } }
 function saveTokens(){ localStorage.setItem('auction_tokens',JSON.stringify(state.tokens)); updateTokenStatusUI(); }
+
 function updateTokenStatusUI(){
-  const el=document.getElementById('tokenStatus');
-  const keys=Object.keys(state.tokens);
-  if(keys.length===0){ el.textContent='Нет токенов'; return; }
-  let soonest=null;
+  const el = document.getElementById('tokenStatus');
+  const keys = Object.keys(state.tokens);
+  
+  if(keys.length===0){ 
+    el.textContent='Нет токенов'; 
+    el.style.color = '#dc2626';
+    return; 
+  }
+  
+  let soonest = null;
+  let methodsList = [];
   keys.forEach(k=>{
-    const t=state.tokens[k].expiresAt;
-    if(!t) return;
-    const d=new Date(t);
-    if(isNaN(d)) return;
-    if(!soonest||d<soonest) soonest=d;
+    const t = state.tokens[k];
+    if(!t || !t.token) return;
+    if(t.expiresAt){
+      const d = new Date(t.expiresAt);
+      if(isNaN(d)) return;
+      if(!soonest || d < soonest) soonest = d;
+    }
+    methodsList.push(k);
   });
-  el.textContent=`${keys.length} токен(ов)` + (soonest?`, ближайший истекает ${soonest.toLocaleString()}`:'');
+  
+  el.textContent = `${methodsList.length} метод(ов): ${methodsList.join(', ')}`;
+  el.style.color = '#16a34a';
+  
+  if(soonest){
+    el.textContent += ` (до ${soonest.toLocaleDateString('ru-RU')})`;
+  }
 }
 
 // получение токена для конкретного метода
@@ -149,13 +166,11 @@ function tokenForMethod(method){
 
 // Улучшенная функция fetch с поддержкой прокси
 async function fetchWithProxy(url, options = {}) {
-  // Если прокси отключен или это локальный запрос, делаем прямой запрос
   if (!PROXY_CONFIG.enabled || url.startsWith('/') || url.includes(location.origin)) {
     return await directFetch(url, options);
   }
   
   try {
-    // Используем Vercel прокси
     const proxyResponse = await fetch(PROXY_CONFIG.endpoint, {
       method: 'POST',
       headers: {
@@ -177,11 +192,9 @@ async function fetchWithProxy(url, options = {}) {
   } catch (proxyError) {
     console.warn('Proxy failed, trying direct request:', proxyError.message);
     
-    // Если прокси не сработал, пробуем прямой запрос
     try {
       return await directFetch(url, options);
     } catch (directError) {
-      // Если прямой запрос тоже не сработал, пробуем публичный CORS прокси
       return await fetchWithPublicProxy(url, options);
     }
   }
@@ -243,8 +256,22 @@ async function fetchWithPublicProxy(url, options = {}) {
   throw new Error('All fetch methods failed');
 }
 
-// Основная функция для всех запросов
-async function fetchJson(url, options = {}) {
+// Основная функция для всех запросов с авторизацией
+async function fetchJson(url, options = {}, methodName = null) {
+  // Автоматически добавляем токен авторизации для платных методов
+  if (methodName) {
+    const token = tokenForMethod(methodName);
+    if (token) {
+      options.headers = {
+        ...options.headers,
+        'Authorization': 'Bearer ' + token
+      };
+    } else {
+      showMessage(`Для метода "${methodName}" требуется оплата. Сформируйте и оплатите счет.`, 'error');
+      throw new Error(`Token required for ${methodName}`);
+    }
+  }
+  
   return await fetchWithProxy(url, options);
 }
 
@@ -291,14 +318,12 @@ async function payBill() {
       return; 
     }
     
-    // Получаем информацию об оплаченных методах
     const info = await fetchJson(cfg.paymentUrl + '/payment/info', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paymentArtifact: state.paymentArtifact })
     });
     
-    // Сохраняем токен для каждого оплаченного метода
     info.methods.forEach(m => {
       state.tokens[m] = { 
         token: body.token, 
@@ -307,7 +332,7 @@ async function payBill() {
     });
     
     saveTokens();
-    showMessage('Оплата прошла. Токены для методов получены', 'success');
+    showMessage('Оплата прошла успешно. Токены для методов получены', 'success');
     state.paymentArtifact = null;
   } catch(err) { 
     console.error(err); 
@@ -432,21 +457,12 @@ async function handleSave(id, tr) {
   if ('owner_id' in edits) payload.owner_id = edits.owner_id;
   if ('auction_end_date' in edits) payload.auction_end_date = formatDateForAPI(edits.auction_end_date);
   
-  const token = tokenForMethod('UpdateLot');
-  if (!token) {
-    showMessage('Оплатите метод UpdateLot', 'error');
-    return;
-  }
-  
   try {
     await fetchJson(cfg.auctionUrl + '/lots/' + encodeURIComponent(id), {
       method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + token
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
-    });
+    }, 'UpdateLot');
     
     delete state.editing[id];
     await loadLots();
@@ -460,17 +476,10 @@ async function handleSave(id, tr) {
 async function handleDelete(id) {
   if (!confirm('Удалить лот #' + id + '?')) return;
   
-  const token = tokenForMethod('DeleteLot');
-  if (!token) {
-    showMessage('Оплатите метод DeleteLot', 'error');
-    return;
-  }
-  
   try {
     await fetchJson(cfg.auctionUrl + '/lots/' + encodeURIComponent(id), {
-      method: 'DELETE',
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
+      method: 'DELETE'
+    }, 'DeleteLot');
     
     await loadLots();
     showMessage('Lot удалён', 'success');
@@ -494,12 +503,6 @@ document.getElementById('newLotForm').onsubmit = async (e) => {
     return;
   }
   
-  const token = tokenForMethod('CreateLot');
-  if (!token) {
-    showMessage('Оплатите метод CreateLot', 'error');
-    return;
-  }
-  
   const payload = {
     name,
     start_price,
@@ -510,12 +513,9 @@ document.getElementById('newLotForm').onsubmit = async (e) => {
   try {
     await fetchJson(cfg.auctionUrl + '/lots', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + token
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
-    });
+    }, 'CreateLot');
     
     showMessage('Лот создан', 'success');
     e.target.reset();
@@ -564,21 +564,12 @@ document.getElementById('btnPlaceBid').onclick = async () => {
     return;
   }
   
-  const token = tokenForMethod('PlaceBid');
-  if (!token) {
-    showMessage('Оплатите метод PlaceBid', 'error');
-    return;
-  }
-  
   try {
     await fetchJson(cfg.auctionUrl + '/lots/' + encodeURIComponent(currentBidLotId) + '/bid', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + token
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bid_amount: amount })
-    });
+    }, 'PlaceBid');
     
     document.getElementById('bidMessage').textContent = 'Ставка принята';
     await loadLots();
@@ -593,6 +584,8 @@ document.getElementById('btnPlaceBid').onclick = async () => {
       document.getElementById('bidMessage').textContent = 'Ставка должна быть больше текущей цены';
     } else if (errorMsg.includes('Auction has ended')) {
       document.getElementById('bidMessage').textContent = 'Аукцион уже завершен';
+    } else if (err.message.includes('Token required')) {
+      document.getElementById('bidMessage').textContent = 'Для ставок требуется оплатить метод PlaceBid';
     } else {
       document.getElementById('bidMessage').textContent = 'Ошибка: ' + errorMsg;
     }
@@ -614,17 +607,27 @@ document.getElementById('btnPayBill').onclick = payBill;
 document.getElementById('btnShowTokens').onclick = () => {
   const keys = Object.keys(state.tokens || {});
   if (keys.length === 0) {
-    alert('Токенов нет');
+    alert('Токенов нет. Сначала оплатите методы через "Сформировать счет" и "Оплатить счет".');
     return;
   }
   
-  let txt = 'Токены:\n';
+  let txt = 'ОПЛАЧЕННЫЕ МЕТОДЫ:\n\n';
   keys.forEach(k => {
-    const expires = state.tokens[k].expiresAt ? 
-      new Date(state.tokens[k].expiresAt).toLocaleString() : 
+    const tokenInfo = state.tokens[k];
+    const expires = tokenInfo.expiresAt ? 
+      new Date(tokenInfo.expiresAt).toLocaleString('ru-RU') : 
       '(без срока)';
-    txt += `${k} -> истекает: ${expires}\n`;
+    const tokenPreview = tokenInfo.token ? 
+      tokenInfo.token.substring(0, 20) + '...' : 
+      'Нет токена';
+    
+    txt += `${k}\n`;
+    txt += `  Токен: ${tokenPreview}\n`;
+    txt += `  Истекает: ${expires}\n`;
+    txt += '─'.repeat(40) + '\n';
   });
+  
+  txt += `\nВсего оплачено методов: ${keys.length}`;
   
   alert(txt);
 };
@@ -635,6 +638,7 @@ proxyToggleBtn.className = 'btn small';
 proxyToggleBtn.textContent = 'Proxy: ON';
 proxyToggleBtn.style.marginLeft = '8px';
 proxyToggleBtn.style.fontSize = '12px';
+proxyToggleBtn.style.background = '#4ade80';
 proxyToggleBtn.onclick = () => {
   PROXY_CONFIG.enabled = !PROXY_CONFIG.enabled;
   proxyToggleBtn.textContent = `Proxy: ${PROXY_CONFIG.enabled ? 'ON' : 'OFF'}`;
