@@ -99,6 +99,12 @@ const cfg = {
   serviceName: "AuctionService"
 };
 
+// Конфигурация прокси
+const PROXY_CONFIG = {
+  enabled: true, // Включить/выключить прокси
+  endpoint: '/api/proxy' // Эндпоинт прокси на Vercel
+};
+
 const state = {
   lots: [],
   editing: new Map(),
@@ -141,104 +147,254 @@ function tokenForMethod(method){
   return info.token;
 }
 
-async function fetchJson(url,opts={}){ 
-  const res=await fetch(url,opts); 
-  const text=await res.text(); 
-  let body=null; 
-  try{body=text?JSON.parse(text):null;}catch(e){}
-  if(!res.ok){ 
-    const err=new Error((body?.error||body?.message||body?.description)||`HTTP ${res.status}`);
-    err.status=res.status; 
-    err.body=body; 
+// Улучшенная функция fetch с поддержкой прокси
+async function fetchWithProxy(url, options = {}) {
+  // Если прокси отключен или это локальный запрос, делаем прямой запрос
+  if (!PROXY_CONFIG.enabled || url.startsWith('/') || url.includes(location.origin)) {
+    return await directFetch(url, options);
+  }
+  
+  try {
+    // Используем Vercel прокси
+    const proxyResponse = await fetch(PROXY_CONFIG.endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url: url,
+        options: options
+      })
+    });
+    
+    if (!proxyResponse.ok) {
+      const errorText = await proxyResponse.text();
+      throw new Error(`Proxy error: ${proxyResponse.status} - ${errorText}`);
+    }
+    
+    return await proxyResponse.json();
+    
+  } catch (proxyError) {
+    console.warn('Proxy failed, trying direct request:', proxyError.message);
+    
+    // Если прокси не сработал, пробуем прямой запрос
+    try {
+      return await directFetch(url, options);
+    } catch (directError) {
+      // Если прямой запрос тоже не сработал, пробуем публичный CORS прокси
+      return await fetchWithPublicProxy(url, options);
+    }
+  }
+}
+
+// Прямой fetch запрос
+async function directFetch(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      ...options.headers
+    }
+  });
+  
+  const text = await response.text();
+  let body = null;
+  
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch (e) {
+    console.warn('JSON parse error:', e);
+    body = { text: text };
+  }
+  
+  if (!response.ok) {
+    const err = new Error(body?.error || body?.message || body?.text || `HTTP ${response.status}`);
+    err.status = response.status;
+    err.body = body;
     throw err;
-  } 
-  return body; 
+  }
+  
+  return body;
+}
+
+// Использование публичных CORS прокси в крайнем случае
+async function fetchWithPublicProxy(url, options = {}) {
+  const publicProxies = [
+    'https://api.allorigins.win/raw?url=',
+    'https://corsproxy.io/?',
+    'https://thingproxy.freeboard.io/fetch/'
+  ];
+  
+  for (const proxy of publicProxies) {
+    try {
+      const proxyUrl = proxy + encodeURIComponent(url);
+      const response = await fetch(proxyUrl, options);
+      
+      if (response.ok) {
+        const text = await response.text();
+        return text ? JSON.parse(text) : null;
+      }
+    } catch (e) {
+      console.warn(`Public proxy ${proxy} failed:`, e.message);
+    }
+  }
+  
+  throw new Error('All fetch methods failed');
+}
+
+// Основная функция для всех запросов
+async function fetchJson(url, options = {}) {
+  return await fetchWithProxy(url, options);
 }
 
 /* ====== Payment ====== */
-async function requestBill(periodFrom,periodTo,methods){
-  try{
-    const payload={ serviceName:cfg.serviceName, dateFrom:periodFrom, dateTo:periodTo, methods };
-    const body=await fetchJson(cfg.paymentUrl+'/bill',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    state.paymentArtifact=body.paymentArtifact;
-    showMessage(`Счёт сформирован. Артефакт: ${body.paymentArtifact}`,'success');
-  }catch(err){ console.error(err); showMessage('Ошибка формирования счета: '+(err.body?.description||err.message),'error'); }
+async function requestBill(periodFrom, periodTo, methods) {
+  try {
+    const payload = { 
+      serviceName: cfg.serviceName, 
+      dateFrom: periodFrom, 
+      dateTo: periodTo, 
+      methods 
+    };
+    
+    const body = await fetchJson(cfg.paymentUrl + '/bill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    
+    state.paymentArtifact = body.paymentArtifact;
+    showMessage(`Счёт сформирован. Артефакт: ${body.paymentArtifact}`, 'success');
+  } catch(err) { 
+    console.error(err); 
+    showMessage('Ошибка формирования счета: ' + (err.body?.description || err.message || err.toString()), 'error'); 
+  }
 }
 
-async function payBill(){
-  if(!state.paymentArtifact){ showMessage('Сначала сформируйте счёт','error'); return; }
-  try{
-    const payload={ paymentArtifact: state.paymentArtifact };
-    const body=await fetchJson(cfg.paymentUrl+'/pay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    if(!body.token){ showMessage('Ошибка: токен не получен','error'); return; }
+async function payBill() {
+  if (!state.paymentArtifact) { 
+    showMessage('Сначала сформируйте счёт', 'error'); 
+    return; 
+  }
+  
+  try {
+    const payload = { paymentArtifact: state.paymentArtifact };
+    const body = await fetchJson(cfg.paymentUrl + '/pay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    
+    if (!body.token) { 
+      showMessage('Ошибка: токен не получен', 'error'); 
+      return; 
+    }
     
     // Получаем информацию об оплаченных методах
-    const info=await fetchJson(cfg.paymentUrl+'/payment/info',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paymentArtifact:state.paymentArtifact})});
+    const info = await fetchJson(cfg.paymentUrl + '/payment/info', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paymentArtifact: state.paymentArtifact })
+    });
     
     // Сохраняем токен для каждого оплаченного метода
-    info.methods.forEach(m=>{
-      state.tokens[m]={ token: body.token, expiresAt: info.paidUntil || null };
+    info.methods.forEach(m => {
+      state.tokens[m] = { 
+        token: body.token, 
+        expiresAt: info.paidUntil || null 
+      };
     });
+    
     saveTokens();
-    showMessage('Оплата прошла. Токены для методов получены','success');
-    state.paymentArtifact=null;
-  }catch(err){ console.error(err); showMessage('Оплата не удалась: '+(err.body?.description||err.message),'error'); }
+    showMessage('Оплата прошла. Токены для методов получены', 'success');
+    state.paymentArtifact = null;
+  } catch(err) { 
+    console.error(err); 
+    showMessage('Оплата не удалась: ' + (err.body?.description || err.message || err.toString()), 'error'); 
+  }
 }
 
 /* ====== CRUD + Bid ====== */
-async function loadLots(){
-  try{
-    const body=await fetchJson(cfg.auctionUrl+'/lots');
-    state.lots=Array.isArray(body)?body:[];
+async function loadLots() {
+  try {
+    const body = await fetchJson(cfg.auctionUrl + '/lots');
+    state.lots = Array.isArray(body) ? body : [];
     renderTable();
-    showMessage('Лоты загружены','success',1500);
-  }catch(err){ console.error(err); showMessage('Не удалось загрузить лоты: '+(err.body?.error||err.message),'error'); }
+    showMessage('Лоты загружены', 'success', 1500);
+  } catch(err) { 
+    console.error(err); 
+    showMessage('Не удалось загрузить лоты: ' + (err.body?.error || err.message || err.toString()), 'error'); 
+  }
 }
 
-function renderTable(){
-  const tbody=document.querySelector('#lotsTable tbody');
-  tbody.innerHTML='';
-  for(const lot of state.lots){
-    const tr=document.createElement('tr');
-    tr.dataset.id=lot.id;
-    tr.innerHTML=`<td>${lot.id}</td>
-<td class="editable" data-field="name">${escapeHtml(lot.name??'')}</td>
-<td class="editable" data-field="description">${escapeHtml(lot.description??'')}</td>
-<td>${lot.start_price??0}</td>
-<td>${lot.current_price??'-'}</td>
-<td class="editable" data-field="owner_id">${escapeHtml(lot.owner_id??'')}</td>
-<td class="editable" data-field="auction_end_date">${escapeHtml(formatDateForDisplay(lot.auction_end_date??''))}</td>
-<td>
-<button class="btn" data-action="save">Save</button>
-<button class="btn" data-action="delete">Delete</button>
-<button class="btn" data-action="bid">Bid</button>
-</td>`;
+function renderTable() {
+  const tbody = document.querySelector('#lotsTable tbody');
+  tbody.innerHTML = '';
+  
+  for (const lot of state.lots) {
+    const tr = document.createElement('tr');
+    tr.dataset.id = lot.id;
+    tr.innerHTML = `
+      <td>${lot.id}</td>
+      <td class="editable" data-field="name">${escapeHtml(lot.name ?? '')}</td>
+      <td class="editable" data-field="description">${escapeHtml(lot.description ?? '')}</td>
+      <td>${lot.start_price ?? 0}</td>
+      <td>${lot.current_price ?? '-'}</td>
+      <td class="editable" data-field="owner_id">${escapeHtml(lot.owner_id ?? '')}</td>
+      <td class="editable" data-field="auction_end_date">${escapeHtml(formatDateForDisplay(lot.auction_end_date ?? ''))}</td>
+      <td>
+        <button class="btn" data-action="save">Save</button>
+        <button class="btn" data-action="delete">Delete</button>
+        <button class="btn" data-action="bid">Bid</button>
+      </td>
+    `;
     tbody.appendChild(tr);
   }
 
-  document.querySelectorAll('#lotsTable td.editable').forEach(td=>{
-    td.ondblclick=()=>{
-      const prev=td.textContent; td.contentEditable="true"; td.classList.add('editing'); td.focus();
-      td.onblur=()=>{
-        td.contentEditable="false"; td.onblur=null;
-        const id=td.parentElement.dataset.id; const field=td.dataset.field;
-        if(!state.editing[id]) state.editing[id]={};
-        state.editing[id][field]=td.textContent.trim();
+  // Редактирование по двойному клику
+  document.querySelectorAll('#lotsTable td.editable').forEach(td => {
+    td.ondblclick = () => {
+      const prev = td.textContent;
+      td.contentEditable = "true";
+      td.classList.add('editing');
+      td.focus();
+      
+      td.onblur = () => {
+        td.contentEditable = "false";
+        td.onblur = null;
+        const id = td.parentElement.dataset.id;
+        const field = td.dataset.field;
+        
+        if (!state.editing[id]) state.editing[id] = {};
+        state.editing[id][field] = td.textContent.trim();
       };
     };
   });
 
-  document.querySelectorAll('#lotsTable button').forEach(btn=>{
-    btn.onclick=async(e)=>{
-      const tr=e.target.closest('tr'); const id=tr.dataset.id; const action=e.target.dataset.action;
-      if(action==='save') await handleSave(id,tr);
-      if(action==='delete') await handleDelete(id);
-      if(action==='bid') await openBidModal(id);
+  // Обработчики кнопок
+  document.querySelectorAll('#lotsTable button').forEach(btn => {
+    btn.onclick = async (e) => {
+      const tr = e.target.closest('tr');
+      const id = tr.dataset.id;
+      const action = e.target.dataset.action;
+      
+      if (action === 'save') await handleSave(id, tr);
+      if (action === 'delete') await handleDelete(id);
+      if (action === 'bid') await openBidModal(id);
     };
   });
 }
 
-function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[c]));
+}
 
 function formatDateForDisplay(dateString) {
   if (!dateString) return '';
@@ -252,11 +408,9 @@ function formatDateForDisplay(dateString) {
 
 function formatDateForAPI(dateString) {
   if (!dateString) return '';
-  // Если дата уже в формате гггг-мм-дд, возвращаем как есть
   if (/^\d{4}-\d{2}-\d{2}$/.test(dateString)) {
     return dateString;
   }
-  // Иначе пытаемся преобразовать
   try {
     const date = new Date(dateString);
     return date.toISOString().split('T')[0];
@@ -265,152 +419,232 @@ function formatDateForAPI(dateString) {
   }
 }
 
-async function handleSave(id,tr){
-  const edits=state.editing[id]; if(!edits||Object.keys(edits).length===0){ showMessage('Нет изменений','info'); return; }
-  const payload={}; 
-  if('name'in edits) payload.name=edits.name; 
-  if('description'in edits) payload.description=edits.description;
-  if('owner_id'in edits) payload.owner_id=edits.owner_id;
-  if('auction_end_date'in edits) payload.auction_end_date=formatDateForAPI(edits.auction_end_date);
+async function handleSave(id, tr) {
+  const edits = state.editing[id];
+  if (!edits || Object.keys(edits).length === 0) {
+    showMessage('Нет изменений', 'info');
+    return;
+  }
   
-  const token=tokenForMethod('UpdateLot'); if(!token){ showMessage('Оплатите метод UpdateLot','error'); return; }
-  try{ 
-    await fetchJson(cfg.auctionUrl+'/lots/'+encodeURIComponent(id),{
-      method:'PUT',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
-      body:JSON.stringify(payload)
+  const payload = {};
+  if ('name' in edits) payload.name = edits.name;
+  if ('description' in edits) payload.description = edits.description;
+  if ('owner_id' in edits) payload.owner_id = edits.owner_id;
+  if ('auction_end_date' in edits) payload.auction_end_date = formatDateForAPI(edits.auction_end_date);
+  
+  const token = tokenForMethod('UpdateLot');
+  if (!token) {
+    showMessage('Оплатите метод UpdateLot', 'error');
+    return;
+  }
+  
+  try {
+    await fetchJson(cfg.auctionUrl + '/lots/' + encodeURIComponent(id), {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify(payload)
     });
-    delete state.editing[id]; 
-    await loadLots(); 
-    showMessage('Lot обновлён','success');
-  }catch(err){ 
-    console.error(err); 
-    showMessage('Ошибка при обновлении: '+(err.body?.error||err.message),'error'); 
+    
+    delete state.editing[id];
+    await loadLots();
+    showMessage('Lot обновлён', 'success');
+  } catch(err) {
+    console.error(err);
+    showMessage('Ошибка при обновлении: ' + (err.body?.error || err.message || err.toString()), 'error');
   }
 }
 
-async function handleDelete(id){
-  if(!confirm('Удалить лот #'+id+'?')) return;
-  const token=tokenForMethod('DeleteLot'); if(!token){ showMessage('Оплатите метод DeleteLot','error'); return; }
-  try{ 
-    await fetchJson(cfg.auctionUrl+'/lots/'+encodeURIComponent(id),{
-      method:'DELETE',
-      headers:{'Authorization':'Bearer '+token}
-    }); 
-    await loadLots(); 
-    showMessage('Lot удалён','success'); 
-  }catch(err){ 
-    console.error(err); 
-    showMessage('Не удалось удалить: '+(err.body?.error||err.message),'error'); 
+async function handleDelete(id) {
+  if (!confirm('Удалить лот #' + id + '?')) return;
+  
+  const token = tokenForMethod('DeleteLot');
+  if (!token) {
+    showMessage('Оплатите метод DeleteLot', 'error');
+    return;
+  }
+  
+  try {
+    await fetchJson(cfg.auctionUrl + '/lots/' + encodeURIComponent(id), {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    
+    await loadLots();
+    showMessage('Lot удалён', 'success');
+  } catch(err) {
+    console.error(err);
+    showMessage('Не удалось удалить: ' + (err.body?.error || err.message || err.toString()), 'error');
   }
 }
 
-document.getElementById('newLotForm').onsubmit=async(e)=>{
+// Создание нового лота
+document.getElementById('newLotForm').onsubmit = async (e) => {
   e.preventDefault();
-  const name=document.getElementById('new_name').value.trim();
-  const start_price=parseFloat(document.getElementById('new_start_price').value);
-  const auction_end_date=document.getElementById('new_auction_end_date').value.trim();
-  const description=document.getElementById('new_description').value.trim();
-  if(!name||isNaN(start_price)){ showMessage('Заполните имя и стартовую цену','error'); return; }
-  const token=tokenForMethod('CreateLot'); if(!token){ showMessage('Оплатите метод CreateLot','error'); return; }
-  const payload={
+  
+  const name = document.getElementById('new_name').value.trim();
+  const start_price = parseFloat(document.getElementById('new_start_price').value);
+  const auction_end_date = document.getElementById('new_auction_end_date').value.trim();
+  const description = document.getElementById('new_description').value.trim();
+  
+  if (!name || isNaN(start_price)) {
+    showMessage('Заполните имя и стартовую цену', 'error');
+    return;
+  }
+  
+  const token = tokenForMethod('CreateLot');
+  if (!token) {
+    showMessage('Оплатите метод CreateLot', 'error');
+    return;
+  }
+  
+  const payload = {
     name,
     start_price,
     auction_end_date: formatDateForAPI(auction_end_date) || undefined,
     description: description || undefined
   };
-  try{ 
-    await fetchJson(cfg.auctionUrl+'/lots',{
-      method:'POST',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
-      body:JSON.stringify(payload)
-    }); 
-    showMessage('Лот создан','success'); 
-    e.target.reset(); 
+  
+  try {
+    await fetchJson(cfg.auctionUrl + '/lots', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify(payload)
+    });
+    
+    showMessage('Лот создан', 'success');
+    e.target.reset();
     await loadLots();
-  }catch(err){ 
-    console.error(err); 
-    showMessage('Ошибка при создании: '+(err.body?.error||err.message),'error'); 
+  } catch(err) {
+    console.error(err);
+    showMessage('Ошибка при создании: ' + (err.body?.error || err.message || err.toString()), 'error');
   }
 };
 
 /* ---------- Ставки ---------- */
-let currentBidLotId=null;
-async function openBidModal(id){
-  currentBidLotId=id;
-  const lot=state.lots.find(l=>String(l.id)===String(id));
+let currentBidLotId = null;
+
+async function openBidModal(id) {
+  currentBidLotId = id;
+  const lot = state.lots.find(l => String(l.id) === String(id));
   const currentPrice = lot.current_price ?? lot.start_price ?? 0;
-  document.getElementById('bidLotInfo').textContent=lot?`${lot.id} — ${lot.name} (текущая: ${currentPrice})`:`Лот ${id}`;
-  document.getElementById('bid_amount').value='';
+  
+  document.getElementById('bidLotInfo').textContent = lot ? 
+    `${lot.id} — ${lot.name} (текущая: ${currentPrice})` : 
+    `Лот ${id}`;
+  
+  document.getElementById('bid_amount').value = '';
   document.getElementById('bid_amount').min = (currentPrice + 0.01).toFixed(2);
   document.getElementById('bid_amount').placeholder = `Минимум ${(currentPrice + 0.01).toFixed(2)}`;
-  document.getElementById('bidMessage').textContent='';
-  document.getElementById('bidModal').style.display='flex';
+  document.getElementById('bidMessage').textContent = '';
+  document.getElementById('bidModal').style.display = 'flex';
 }
 
-document.getElementById('btnCloseBid').onclick=()=>{ document.getElementById('bidModal').style.display='none'; };
+document.getElementById('btnCloseBid').onclick = () => {
+  document.getElementById('bidModal').style.display = 'none';
+};
 
-document.getElementById('btnPlaceBid').onclick=async()=>{
-  const amount=parseFloat(document.getElementById('bid_amount').value);
-  const lot=state.lots.find(l=>String(l.id)===String(currentBidLotId));
+document.getElementById('btnPlaceBid').onclick = async () => {
+  const amount = parseFloat(document.getElementById('bid_amount').value);
+  const lot = state.lots.find(l => String(l.id) === String(currentBidLotId));
   const currentPrice = lot.current_price ?? lot.start_price ?? 0;
   
-  if(isNaN(amount)||amount<=0){ 
-    document.getElementById('bidMessage').textContent='Введите корректную сумму'; 
-    return;
-  }
-  if(amount <= currentPrice){
-    document.getElementById('bidMessage').textContent=`Ставка должна быть больше текущей цены (${currentPrice})`;
+  if (isNaN(amount) || amount <= 0) {
+    document.getElementById('bidMessage').textContent = 'Введите корректную сумму';
     return;
   }
   
-  const token=tokenForMethod('PlaceBid'); if(!token){ showMessage('Оплатите метод PlaceBid','error'); return; }
-  try{
-    await fetchJson(cfg.auctionUrl+'/lots/'+encodeURIComponent(currentBidLotId)+'/bid',{
-      method:'POST',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
-      body:JSON.stringify({bid_amount:amount})
+  if (amount <= currentPrice) {
+    document.getElementById('bidMessage').textContent = `Ставка должна быть больше текущей цены (${currentPrice})`;
+    return;
+  }
+  
+  const token = tokenForMethod('PlaceBid');
+  if (!token) {
+    showMessage('Оплатите метод PlaceBid', 'error');
+    return;
+  }
+  
+  try {
+    await fetchJson(cfg.auctionUrl + '/lots/' + encodeURIComponent(currentBidLotId) + '/bid', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify({ bid_amount: amount })
     });
-    document.getElementById('bidMessage').textContent='Ставка принята';
+    
+    document.getElementById('bidMessage').textContent = 'Ставка принята';
     await loadLots();
-    setTimeout(()=>document.getElementById('bidModal').style.display='none',800);
-  }catch(err){ 
-    console.error(err); 
-    const errorMsg = err.body?.error || err.message || err.status;
-    // Специфическая обработка ошибок ставок
+    setTimeout(() => {
+      document.getElementById('bidModal').style.display = 'none';
+    }, 800);
+  } catch(err) {
+    console.error(err);
+    const errorMsg = err.body?.error || err.message || err.status || err.toString();
+    
     if (errorMsg.includes('greater than current price')) {
-      document.getElementById('bidMessage').textContent='Ставка должна быть больше текущей цены';
+      document.getElementById('bidMessage').textContent = 'Ставка должна быть больше текущей цены';
     } else if (errorMsg.includes('Auction has ended')) {
-      document.getElementById('bidMessage').textContent='Аукцион уже завершен';
+      document.getElementById('bidMessage').textContent = 'Аукцион уже завершен';
     } else {
-      document.getElementById('bidMessage').textContent='Ошибка: ' + errorMsg;
+      document.getElementById('bidMessage').textContent = 'Ошибка: ' + errorMsg;
     }
   }
 };
 
 /* ---------- UI кнопки ---------- */
-document.getElementById('btnRequestBill').onclick=()=>{ 
-  const now=new Date(); 
-  const later=new Date(now.getTime()+1000*60*60*24); 
-  // Используем правильный формат дат (только дата)
+document.getElementById('btnRequestBill').onclick = () => {
+  const now = new Date();
+  const later = new Date(now.getTime() + 1000 * 60 * 60 * 24);
   const dateFrom = now.toISOString().split('T')[0];
   const dateTo = later.toISOString().split('T')[0];
-  requestBill(dateFrom, dateTo, ['CreateLot','UpdateLot','DeleteLot','PlaceBid']); 
+  
+  requestBill(dateFrom, dateTo, ['CreateLot', 'UpdateLot', 'DeleteLot', 'PlaceBid']);
 };
 
-document.getElementById('btnPayBill').onclick=payBill;
+document.getElementById('btnPayBill').onclick = payBill;
 
-document.getElementById('btnShowTokens').onclick=()=>{
-  const keys=Object.keys(state.tokens||{}); 
-  if(keys.length===0){ alert('Токенов нет'); return;}
-  let txt='Токены:\n'; 
-  keys.forEach(k=>{
-    const expires = state.tokens[k].expiresAt ? new Date(state.tokens[k].expiresAt).toLocaleString() : '(без срока)';
+document.getElementById('btnShowTokens').onclick = () => {
+  const keys = Object.keys(state.tokens || {});
+  if (keys.length === 0) {
+    alert('Токенов нет');
+    return;
+  }
+  
+  let txt = 'Токены:\n';
+  keys.forEach(k => {
+    const expires = state.tokens[k].expiresAt ? 
+      new Date(state.tokens[k].expiresAt).toLocaleString() : 
+      '(без срока)';
     txt += `${k} -> истекает: ${expires}\n`;
-  }); 
+  });
+  
   alert(txt);
 };
 
+// Кнопка для включения/выключения прокси
+const proxyToggleBtn = document.createElement('button');
+proxyToggleBtn.className = 'btn small';
+proxyToggleBtn.textContent = 'Proxy: ON';
+proxyToggleBtn.style.marginLeft = '8px';
+proxyToggleBtn.style.fontSize = '12px';
+proxyToggleBtn.onclick = () => {
+  PROXY_CONFIG.enabled = !PROXY_CONFIG.enabled;
+  proxyToggleBtn.textContent = `Proxy: ${PROXY_CONFIG.enabled ? 'ON' : 'OFF'}`;
+  proxyToggleBtn.style.background = PROXY_CONFIG.enabled ? '#4ade80' : '#f87171';
+  showMessage(`Прокси ${PROXY_CONFIG.enabled ? 'включен' : 'выключен'}`, 'info', 2000);
+};
+
+document.querySelector('.controls').appendChild(proxyToggleBtn);
+
+// Инициализация
 updateTokenStatusUI();
 loadLots();
 </script>
